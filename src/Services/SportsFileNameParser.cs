@@ -1250,6 +1250,12 @@ public class SportsFileNameParser
             { @"^IMSA[\.\-\s]+SportsCar[\.\-\s]+Championship[\.\-\s]", ("Motorsport", "IMSA SportsCar Championship") },
             { @"^Supercars?[\.\-\s]", ("Motorsport", "Supercars") },
             { @"^BTCC[\.\-\s]", ("Motorsport", "BTCC") },
+            // Spelled-out promotion names, as TheTVDB and Sonarr name the
+            // series ("All Elite Wrestling - Collision - 2024-02-03 - ...").
+            { @"^Bare[\.\-\s]+Knuckle[\.\-\s]+Fighting[\.\-\s]+Championship[\.\-\s]", ("Fighting", "BKFC") },
+            { @"^Ultimate[\.\-\s]+Fighting[\.\-\s]+Championship[\.\-\s]", ("Fighting", "UFC") },
+            { @"^World[\.\-\s]+Wrestling[\.\-\s]+Entertainment[\.\-\s]", ("Wrestling", "WWE") },
+            { @"^All[\.\-\s]+Elite[\.\-\s]+Wrestling[\.\-\s]", ("Wrestling", "AEW") },
             { @"^BKFC[\.\-\s]", ("Fighting", "BKFC") },
             { @"^UFC[\.\-\s]", ("Fighting", "UFC") },
             { @"^Bellator[\.\-\s]", ("Fighting", "Bellator") },

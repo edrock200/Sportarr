@@ -2780,6 +2780,10 @@ public class ReleaseMatchingService
         foreach (var alias in FootballReleaseNamePolicy.LeagueAliases(league))
             yield return alias;
 
+        // "All Elite Wrestling" for a league stored as "AEW", and so on.
+        foreach (var alias in PromotionAliases.For(league.Name))
+            yield return alias;
+
         // "<Word> <number>" series conventionally abbreviate to first letter
         // + number (Formula 1 → F1). Generated so leagues whose upstream
         // record carries no alternate names still match the common form.

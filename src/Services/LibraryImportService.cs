@@ -208,6 +208,17 @@ public class LibraryImportService
             // Part files still query per file: they also consider events that
             // already have a file, and are rare.
             List<Event>? unfiledEvents = null;
+            async Task<List<Event>> UnfiledEventsAsync() =>
+                unfiledEvents ??= await _db.Events
+                    .Include(e => e.HomeTeam)
+                    .Include(e => e.AwayTeam)
+                    .Include(e => e.League)
+                    .Where(e => !e.HasFile)
+                    .ToListAsync();
+
+            // Numbered weekly shows ("Collision #33") matched by show and air
+            // date, built over the unfiled events on first use.
+            ShowEpisodeMatcher? showMatcher = null;
 
             // The name the matchers see. With ignoreSeasonEpisode the S/E
             // marker is stripped so another provider's numbering cannot veto
@@ -396,6 +407,29 @@ public class LibraryImportService
                         }
                     }
 
+                    // NUMBERED WEEKLY SHOW: a dated file naming a show whose
+                    // events are titled "<Show> #<N>" is matched by show
+                    // number and air date (ShowEpisodeMatcher). The fuzzy
+                    // scorer below cannot get these to the auto-import floor:
+                    // the event title never carries the date the file does.
+                    // Part files keep the fuzzy path, which knows fight cards.
+                    if (matchedEvent == null && !isPartFile)
+                    {
+                        showMatcher ??= new ShowEpisodeMatcher(await UnfiledEventsAsync());
+                        var showMatch = showMatcher.TryMatch(
+                            filename,
+                            Path.GetFileName(Path.GetDirectoryName(filePath)),
+                            e => !e.HasFile && !claimedEventIds.Contains(e.Id));
+                        if (showMatch != null)
+                        {
+                            matchedEvent = showMatch.Event;
+                            matchConfidence = showMatch.Confidence;
+                            claimedEventIds.Add(showMatch.Event.Id);
+                            _logger.LogInformation("[Library Import] Show match: '{File}' = '{Event}' ({Reason})",
+                                filename, showMatch.Event.Title, showMatch.Reason);
+                        }
+                    }
+
                     if (matchedEvent == null && !string.IsNullOrEmpty(eventTitle))
                     {
                         var fightingSports = EventPartDetector.FightingSportNames
@@ -424,13 +458,7 @@ public class LibraryImportService
                         }
                         else
                         {
-                            unfiledEvents ??= await _db.Events
-                                .Include(e => e.HomeTeam)
-                                .Include(e => e.AwayTeam)
-                                .Include(e => e.League)
-                                .Where(e => !e.HasFile)
-                                .ToListAsync();
-                            candidates = unfiledEvents
+                            candidates = (await UnfiledEventsAsync())
                                 .Where(e => !e.HasFile && !claimedEventIds.Contains(e.Id))
                                 .ToList();
                         }
