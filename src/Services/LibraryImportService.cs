@@ -3012,7 +3012,8 @@ public class LibraryImportService
         // One hub request per league season (cached for the scan) instead of
         // one per matched file: a scan of a few hundred matched files made a
         // few hundred sequential metadata requests just to draw previews.
-        var episodeNumber = await _episodeNumberResolver.ResolveBatchAsync(matchedEvent);
+        // An event the season listing lacks still gets its own lookup.
+        var episodeNumber = await _episodeNumberResolver.ResolvePreferSeasonAsync(matchedEvent);
 
         // Use FileNamingService to build folder path - this handles all token replacements
         // ({League}, {Season}, {Year}, {Month}, {Day}, {Episode}, {Event Title}, etc.)

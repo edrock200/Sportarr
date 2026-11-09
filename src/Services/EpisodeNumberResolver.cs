@@ -60,6 +60,20 @@ public class EpisodeNumberResolver
         return await ResolveAsync(eventInfo, snapshot.Numbers);
     }
 
+    /// <summary>
+    /// The season snapshot's number when the hub returned one for this
+    /// event, otherwise exactly <see cref="ResolveAsync"/>'s per-event
+    /// lookup. Unlike <see cref="ResolveBatchAsync"/>, a missing or failed
+    /// snapshot never skips the per-event request, so the result always
+    /// agrees with what an import resolves. Lets a scan that previews many
+    /// events of one season make one request instead of one per event.
+    /// </summary>
+    public async Task<int> ResolvePreferSeasonAsync(Event eventInfo)
+    {
+        var snapshot = await GetSeasonSnapshotAsync(eventInfo);
+        return await ResolveAsync(eventInfo, snapshot.Numbers);
+    }
+
     private async Task<int> ApplyAuthoritativeOrFallbackAsync(Event eventInfo, int? authoritativeNumber)
     {
         if (authoritativeNumber is > 0)
