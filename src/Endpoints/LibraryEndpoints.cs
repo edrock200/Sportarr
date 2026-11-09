@@ -16,11 +16,14 @@ public static class LibraryEndpoints
         // /api/library/import below: a large root folder's ffprobe pass can
         // run for minutes and was outliving reverse-proxy timeouts while the
         // scan kept running invisibly.
-        app.MapPost("/api/library/scan", async (TaskService taskService, string folderPath, bool includeSubfolders = true) =>
+        // ignoreSeasonEpisode: strip S/E markers ("S2024E05") from file names
+        // before matching, for media named against another provider's
+        // episode numbering (e.g. TheTVDB).
+        app.MapPost("/api/library/scan", async (TaskService taskService, string folderPath, bool includeSubfolders = true, bool ignoreSeasonEpisode = false) =>
         {
             try
             {
-                var body = System.Text.Json.JsonSerializer.Serialize(new { folderPath, includeSubfolders });
+                var body = System.Text.Json.JsonSerializer.Serialize(new { folderPath, includeSubfolders, ignoreSeasonEpisode });
                 var task = await taskService.QueueTaskAsync(
                     $"Library Scan ({folderPath})",
                     "LibraryScan",

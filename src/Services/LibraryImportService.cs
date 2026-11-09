@@ -38,6 +38,42 @@ public class LibraryImportService
 
     private static readonly string[] VideoExtensions = SupportedExtensions.Video;
 
+    // How many files ahead of the matcher a scan keeps ffprobe running.
+    private const int ProbeLookahead = 4;
+
+    private static bool IsVideoFile(string path) =>
+        VideoExtensions.Contains(Path.GetExtension(path).ToLowerInvariant());
+
+    /// <summary>
+    /// The video files under a scan root. Folders the scan would discard
+    /// anyway (dot-folders, recycle bins, Synology @eaDir and the other
+    /// <see cref="LibraryPathFilter"/> exclusions) are not descended into:
+    /// Directory.GetFiles walked every one of them, and an @eaDir tree holds
+    /// a thumbnail set for every file in the library. A folder that cannot
+    /// be read is skipped instead of failing the whole scan, and the paths
+    /// stream to the caller instead of being collected up front.
+    /// </summary>
+    private static IEnumerable<string> EnumerateVideoFiles(string root, bool recurse, string? recycleBin)
+    {
+        var options = new EnumerationOptions
+        {
+            RecurseSubdirectories = recurse,
+            IgnoreInaccessible = true,
+            // Directory.GetFiles did not skip hidden or system files.
+            AttributesToSkip = 0,
+        };
+        return new System.IO.Enumeration.FileSystemEnumerable<string>(
+            root,
+            (ref System.IO.Enumeration.FileSystemEntry entry) => entry.ToFullPath(),
+            options)
+        {
+            ShouldIncludePredicate = (ref System.IO.Enumeration.FileSystemEntry entry) =>
+                !entry.IsDirectory && IsVideoFile(entry.FileName.ToString()),
+            ShouldRecursePredicate = (ref System.IO.Enumeration.FileSystemEntry entry) =>
+                !LibraryPathFilter.IsExcluded(entry.ToFullPath(), recycleBin),
+        };
+    }
+
     public LibraryImportService(
         SportarrDbContext db,
         ILogger<LibraryImportService> logger,
@@ -69,12 +105,19 @@ public class LibraryImportService
     /// <summary>
     /// Scan a folder for video files
     /// </summary>
+    /// <param name="ignoreSeasonEpisode">
+    /// Strip S/E markers ("S2024E05") from file names before matching, for
+    /// media named against another provider's (e.g. TheTVDB's) episode
+    /// numbering. See <see cref="SeasonEpisodeTokens"/>.
+    /// </param>
     public Task<LibraryScanResult> ScanFolderAsync(
         string folderPath,
         bool includeSubfolders = true,
         Func<int, int, Task>? onProgress = null,
-        bool includeIgnoredFiles = false) =>
-        ScanPathAsync(folderPath, includeSubfolders, onProgress, includeIgnoredFiles);
+        bool includeIgnoredFiles = false,
+        bool ignoreSeasonEpisode = false) =>
+        ScanPathAsync(folderPath, includeSubfolders, onProgress, includeIgnoredFiles,
+            ignoreSeasonEpisode: ignoreSeasonEpisode);
 
     /// <summary>Analyse only this file using the same filters and event matching as a folder scan.</summary>
     public Task<LibraryScanResult> ScanFileAsync(string filePath) =>
@@ -85,7 +128,8 @@ public class LibraryImportService
         bool includeSubfolders = true,
         Func<int, int, Task>? onProgress = null,
         bool includeIgnoredFiles = false,
-        string? singleFilePath = null)
+        string? singleFilePath = null,
+        bool ignoreSeasonEpisode = false)
     {
         var result = new LibraryScanResult
         {
@@ -107,13 +151,13 @@ public class LibraryImportService
             var settings = await GetMediaManagementSettingsAsync();
             var recycleBin = (await _configService.GetConfigAsync()).RecycleBin;
 
-            var searchOption = includeSubfolders ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
             var files = SampleFileFilter.FilterSamples(
                     LibraryPathFilter.FilterExcluded(
-                        (singleFilePath == null
-                            ? Directory.GetFiles(folderPath, "*.*", searchOption)
-                            : File.Exists(singleFilePath) ? new[] { singleFilePath } : Array.Empty<string>())
-                            .Where(f => VideoExtensions.Contains(Path.GetExtension(f).ToLower())),
+                        singleFilePath == null
+                            ? EnumerateVideoFiles(folderPath, includeSubfolders, recycleBin)
+                            : File.Exists(singleFilePath) && IsVideoFile(singleFilePath)
+                                ? new[] { singleFilePath }
+                                : Array.Empty<string>(),
                         recycleBin),
                     folderPath)
                 .ToList();
@@ -156,9 +200,54 @@ public class LibraryImportService
             var claimedEventIds = new HashSet<int>();
             var supercarsRoundRaceCache = new Dictionary<(int Year, int Round), List<int>>();
 
-            var processedFileCount = 0;
-            foreach (var filePath in files)
+            // Every event without a file, loaded once on first need. The
+            // candidate query used to run once PER FILE, materialising (and
+            // identity-resolving) every unfiled event with its teams and
+            // league each time - the dominant cost of a scan against a large
+            // library. Claimed events are filtered out in memory instead.
+            // Part files still query per file: they also consider events that
+            // already have a file, and are rare.
+            List<Event>? unfiledEvents = null;
+
+            // The name the matchers see. With ignoreSeasonEpisode the S/E
+            // marker is stripped so another provider's numbering cannot veto
+            // the right event; OriginalTitle keeps the name as found.
+            string MatchName(string path)
             {
+                var name = Path.GetFileNameWithoutExtension(path);
+                return ignoreSeasonEpisode ? SeasonEpisodeTokens.Strip(name) : name;
+            }
+
+            bool IsAlreadyInLibrary(string path) =>
+                eventByFilePath.ContainsKey(path) || eventFileByFilePath.ContainsKey(path);
+
+            // ffprobe is the slowest per-file step (a process launch and a
+            // header read, far longer over a network share), and matching
+            // must stay sequential because earlier files claim events. So the
+            // probes for the next few files run ahead of the matcher in
+            // parallel. Files already in the library, or ignored, are never
+            // probed: nothing about their match depends on it.
+            var probes = new Task<ParsedFileInfo>?[files.Count];
+            void StartProbe(int index)
+            {
+                if (index >= files.Count || probes[index] != null)
+                    return;
+                var path = files[index];
+                if (ignoredPaths?.Contains(path) == true || IsAlreadyInLibrary(path))
+                    return;
+                var name = MatchName(path);
+                probes[index] = Task.Run(() => _fileParser.ParseWithInspectionAsync(name, path));
+            }
+
+            var processedFileCount = 0;
+            for (var fileIndex = 0; fileIndex < files.Count; fileIndex++)
+            {
+                var filePath = files[fileIndex];
+                for (var ahead = fileIndex; ahead < fileIndex + ProbeLookahead; ahead++)
+                {
+                    StartProbe(ahead);
+                }
+
                 if (ignoredPaths?.Contains(filePath) == true)
                 {
                     continue;
@@ -166,14 +255,31 @@ public class LibraryImportService
                 try
                 {
                     var fileInfo = new FileInfo(filePath);
-                    var filename = Path.GetFileNameWithoutExtension(filePath);
+                    var originalFilename = Path.GetFileNameWithoutExtension(filePath);
+                    var filename = MatchName(filePath);
+                    // The year a stripped S/E marker carried ("S2024E05"),
+                    // still used to keep the match in the right season.
+                    int? strippedSeasonYear = null;
+                    if (ignoreSeasonEpisode)
+                        SeasonEpisodeTokens.Strip(originalFilename, out strippedSeasonYear);
+
+                    // Check if file is already in library - dictionary lookups against
+                    // the preloaded maps above instead of two FirstOrDefaultAsync calls
+                    // per file.
+                    eventByFilePath.TryGetValue(filePath, out var existingEvent);
+                    eventFileByFilePath.TryGetValue(filePath, out var existingEventFile);
+                    var alreadyInLibrary = existingEvent != null || existingEventFile != null;
 
                     // Try sports-specific parser first for better accuracy
                     var sportsResult = _sportsParser.Parse(filename);
-                    // ParseWithInspectionAsync runs ffprobe when the filename alone doesn't
-                    // give us a Resolution+Source pair. Costs ~50-200ms per uninformative
-                    // file but produces accurate Quality on first scan.
-                    var parsedInfo = await _fileParser.ParseWithInspectionAsync(filename, filePath);
+                    // ParseWithInspectionAsync always runs ffprobe on the file
+                    // (started ahead of time above). A file already in the
+                    // library is only listed, so the filename parse suffices.
+                    var probe = probes[fileIndex];
+                    probes[fileIndex] = null;
+                    var parsedInfo = alreadyInLibrary
+                        ? _fileParser.Parse(filename)
+                        : await (probe ?? _fileParser.ParseWithInspectionAsync(filename, filePath));
 
                     // SampleFileFilter above only catches samples with a literal
                     // "sample" token in the path. A download client's incomplete
@@ -201,7 +307,7 @@ public class LibraryImportService
 
                     // Extract year from filename, path, and parsed data
                     // CRITICAL: This prevents matching files to wrong events from different years
-                    var parsedYear = ExtractYearFromPath(filePath, filename, sportsResult.EventYear, eventDate);
+                    var parsedYear = ExtractYearFromPath(filePath, filename, sportsResult.EventYear ?? strippedSeasonYear, eventDate);
 
                     // Check for explicit SxxxxExx episode number in filename (e.g. "Formula E - S2025E05 - Jeddah E Prix").
                     // This is the highest-confidence signal — explicit S/E parsing wins over fuzzier matchers.
@@ -225,14 +331,7 @@ public class LibraryImportService
                          PartIdentityResolver.HasNamedPartLabel(filePath));
                     var isPartFile = hasPartNumber || hasNamedPart;
 
-                    // Check if file is already in library - dictionary lookups against
-                    // the preloaded maps below instead of two FirstOrDefaultAsync calls
-                    // per file (previously 2 round trips per file, on top of the ffprobe
-                    // inspection cost, for every file under the scanned folder).
-                    eventByFilePath.TryGetValue(filePath, out var existingEvent);
-                    eventFileByFilePath.TryGetValue(filePath, out var existingEventFile);
-
-                    if (existingEvent != null || existingEventFile != null)
+                    if (alreadyInLibrary)
                     {
                         var linkedEvent = existingEvent ?? existingEventFile?.Event;
                         result.AlreadyInLibrary.Add(new ImportableFile
@@ -249,7 +348,7 @@ public class LibraryImportService
                             Codec = parsedInfo.VideoCodec,
                             AudioCodec = parsedInfo.AudioCodec,
                             ReleaseGroup = parsedInfo.ReleaseGroup,
-                            OriginalTitle = filename,
+                            OriginalTitle = originalFilename,
                             Languages = parsedInfo.DetectedLanguages,
                             ExistingEventId = linkedEvent?.Id,
                             MatchedEventTitle = BuildCurrentLabel(linkedEvent, existingEventFile)
@@ -308,17 +407,33 @@ public class LibraryImportService
                         var partTo = hasPartYear
                             ? new DateTime(parsedYear!.Value + 2, 1, 1, 0, 0, 0, DateTimeKind.Utc)
                             : DateTime.MaxValue;
-                        var candidates = await _db.Events
-                            .Include(e => e.HomeTeam)
-                            .Include(e => e.AwayTeam)
-                            .Include(e => e.League)
-                            .Where(e => hasPartNumber ||
-                                (!e.HasFile && !claimedEventIds.Contains(e.Id)) ||
-                                (hasNamedPart && fightingSports.Contains(e.Sport.ToLower()) &&
-                                    (!hasPartYear ||
-                                     (e.EventDate >= partFrom && e.EventDate < partTo) ||
-                                     (e.BroadcastDate >= partFrom && e.BroadcastDate < partTo))))
-                            .ToListAsync();
+                        List<Event> candidates;
+                        if (hasPartNumber || hasNamedPart)
+                        {
+                            candidates = await _db.Events
+                                .Include(e => e.HomeTeam)
+                                .Include(e => e.AwayTeam)
+                                .Include(e => e.League)
+                                .Where(e => hasPartNumber ||
+                                    (!e.HasFile && !claimedEventIds.Contains(e.Id)) ||
+                                    (hasNamedPart && fightingSports.Contains(e.Sport.ToLower()) &&
+                                        (!hasPartYear ||
+                                         (e.EventDate >= partFrom && e.EventDate < partTo) ||
+                                         (e.BroadcastDate >= partFrom && e.BroadcastDate < partTo))))
+                                .ToListAsync();
+                        }
+                        else
+                        {
+                            unfiledEvents ??= await _db.Events
+                                .Include(e => e.HomeTeam)
+                                .Include(e => e.AwayTeam)
+                                .Include(e => e.League)
+                                .Where(e => !e.HasFile)
+                                .ToListAsync();
+                            candidates = unfiledEvents
+                                .Where(e => !e.HasFile && !claimedEventIds.Contains(e.Id))
+                                .ToList();
+                        }
 
                         IReadOnlyCollection<Event> datePeers = Array.Empty<Event>();
                         if (eventDate.HasValue)
@@ -442,7 +557,7 @@ public class LibraryImportService
                         Codec = parsedInfo.VideoCodec,
                         AudioCodec = parsedInfo.AudioCodec,
                         ReleaseGroup = parsedInfo.ReleaseGroup,
-                        OriginalTitle = filename,
+                        OriginalTitle = originalFilename,
                         Languages = parsedInfo.DetectedLanguages,
                         MatchedEventId = matchedEvent?.Id,
                         MatchedEventTitle = matchedEvent?.Title,
@@ -2226,6 +2341,55 @@ public class LibraryImportService
         IReadOnlyCollection<Event>? datePeers = null)
     {
         int confidence = 0;
+        var originalTitle = sourceTitle ?? searchTitle;
+
+        // The two cheapest hard rejections run first. A scan scores every
+        // file against every unfiled event, nearly all of them from another
+        // season or with another episode number, and the identity gates
+        // below are regex-heavy. Every gate before the title arithmetic only
+        // ever returns 0, so their order does not change any result.
+
+        // ── EXPLICIT S/E EPISODE NUMBER ─────────────────────────────────────────
+        // Files with S2025E05 in the name — this IS authoritative since it's the
+        // Sportarr season/episode format used in library filenames.
+        if (explicitEpisodeNumber.HasValue && evt.EpisodeNumber.HasValue)
+        {
+            if (evt.EpisodeNumber.Value == explicitEpisodeNumber.Value)
+                confidence += 50;
+            else
+                return 0; // S/E notation is authoritative — wrong event
+        }
+
+        // ── YEAR / SEASON CHECK ─────────────────────────────────────────────────
+        // CRITICAL: sports events repeat every year. Year mismatch = wrong season.
+        if (parsedYear.HasValue)
+        {
+            // Broadcaster-branded year — release groups tag NYE late-Eastern
+            // airings with the broadcast year, not the UTC year.
+            var eventYear = (evt.BroadcastDate ?? evt.EventDate).Year;
+            var eventSeasonYear = evt.SeasonNumber ?? (int.TryParse(evt.Season, out var sy) ? sy : (int?)null);
+
+            // Accept if parsedYear matches:
+            // (a) the event's calendar year directly, OR
+            // (b) the start year of the season (e.g. SeasonNumber = 2025 for "2025-2026"), OR
+            // (c) the end year of a season span (e.g. SeasonYearEnd = 2026 for "2025-2026")
+            var yearMatches = eventYear == parsedYear.Value
+                || eventSeasonYear == parsedYear.Value
+                || (seasonYearEnd.HasValue && parsedYear.Value <= seasonYearEnd.Value
+                    && eventSeasonYear.HasValue && parsedYear.Value >= eventSeasonYear.Value)
+                || CricketRugbyReleaseNamePolicy.HasSplitSeasonYearMatch(originalTitle, evt);
+
+            if (!yearMatches)
+            {
+                logger?.LogDebug("[Match] Year mismatch: file has {ParsedYear}, event '{Event}' is from {EventYear} (Season: {Season})",
+                    parsedYear.Value, eventTitle, eventYear, evt.Season);
+                return 0;
+            }
+            else
+            {
+                confidence += 25;
+            }
+        }
 
         // ── SERIES LABEL GATE ───────────────────────────────────────────────────
         // A library-format filename names its series ahead of the SxxxxExx token
@@ -2242,7 +2406,6 @@ public class LibraryImportService
             return 0;
         }
 
-        var originalTitle = sourceTitle ?? searchTitle;
         if (IsMlsDatedName(originalTitle) && !MlsNameFitsEvent(originalTitle, searchTitle, evt))
             return 0;
 
@@ -2364,47 +2527,8 @@ public class LibraryImportService
             }
         }
 
-        // ── EXPLICIT S/E EPISODE NUMBER ─────────────────────────────────────────
-        // Files with S2025E05 in the name — this IS authoritative since it's the
-        // Sportarr season/episode format used in library filenames.
-        if (explicitEpisodeNumber.HasValue && evt.EpisodeNumber.HasValue)
-        {
-            if (evt.EpisodeNumber.Value == explicitEpisodeNumber.Value)
-                confidence += 50;
-            else
-                return 0; // S/E notation is authoritative — wrong event
-        }
-
-        // ── YEAR / SEASON CHECK ─────────────────────────────────────────────────
-        // CRITICAL: sports events repeat every year. Year mismatch = wrong season.
-        if (parsedYear.HasValue)
-        {
-            // Broadcaster-branded year — release groups tag NYE late-Eastern
-            // airings with the broadcast year, not the UTC year.
-            var eventYear = (evt.BroadcastDate ?? evt.EventDate).Year;
-            var eventSeasonYear = evt.SeasonNumber ?? (int.TryParse(evt.Season, out var sy) ? sy : (int?)null);
-
-            // Accept if parsedYear matches:
-            // (a) the event's calendar year directly, OR
-            // (b) the start year of the season (e.g. SeasonNumber = 2025 for "2025-2026"), OR
-            // (c) the end year of a season span (e.g. SeasonYearEnd = 2026 for "2025-2026")
-            var yearMatches = eventYear == parsedYear.Value
-                || eventSeasonYear == parsedYear.Value
-                || (seasonYearEnd.HasValue && parsedYear.Value <= seasonYearEnd.Value
-                    && eventSeasonYear.HasValue && parsedYear.Value >= eventSeasonYear.Value)
-                || CricketRugbyReleaseNamePolicy.HasSplitSeasonYearMatch(originalTitle, evt);
-
-            if (!yearMatches)
-            {
-                logger?.LogDebug("[Match] Year mismatch: file has {ParsedYear}, event '{Event}' is from {EventYear} (Season: {Season})",
-                    parsedYear.Value, eventTitle, eventYear, evt.Season);
-                return 0;
-            }
-            else
-            {
-                confidence += 25;
-            }
-        }
+        // (Explicit S/E episode number and year/season checks run first, at
+        // the top of this method.)
 
         // ── DATE GATE ───────────────────────────────────────────────────────────
         // A dated filename is anchored: sports events are date-identified,
@@ -2870,6 +2994,10 @@ public class LibraryImportService
     /// Public wrapper: build the destination preview for a specific event + file combination.
     /// Used by the /api/library/preview endpoint so the UI can refresh the preview after manual selection.
     /// </summary>
+    // Custom formats for destination previews, loaded once per scan rather
+    // than once per matched file.
+    private List<CustomFormat>? _previewCustomFormats;
+
     public async Task<string?> BuildDestinationPreviewForEventAsync(int eventId, string originalFileName)
     {
         var evt = await _db.Events.Include(e => e.League).FirstOrDefaultAsync(e => e.Id == eventId);
@@ -2881,7 +3009,10 @@ public class LibraryImportService
     private async Task<string> BuildDestinationPreviewAsync(Event matchedEvent, string originalFileName, MediaManagementSettings settings)
     {
         var extension = Path.GetExtension(originalFileName);
-        var episodeNumber = await _episodeNumberResolver.ResolveAsync(matchedEvent);
+        // One hub request per league season (cached for the scan) instead of
+        // one per matched file: a scan of a few hundred matched files made a
+        // few hundred sequential metadata requests just to draw previews.
+        var episodeNumber = await _episodeNumberResolver.ResolveBatchAsync(matchedEvent);
 
         // Use FileNamingService to build folder path - this handles all token replacements
         // ({League}, {Season}, {Year}, {Month}, {Day}, {Episode}, {Event Title}, etc.)
@@ -2919,8 +3050,9 @@ public class LibraryImportService
             // this point, so Size/IndexerFlag conditions can't be evaluated
             // here (same as before - this only affects the destination preview
             // shown while picking a file, not the actual import).
+            _previewCustomFormats ??= await _db.CustomFormats.AsNoTracking().ToListAsync();
             tokens.CustomFormats = _customFormatService.BuildRenameToken(
-                originalFileName, await _db.CustomFormats.ToListAsync());
+                originalFileName, _previewCustomFormats);
             filename = _namingService.BuildFileName(settings.StandardFileFormat, tokens, extension, settings.ReplaceIllegalCharacters);
         }
         else

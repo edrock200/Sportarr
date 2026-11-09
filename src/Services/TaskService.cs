@@ -1215,11 +1215,14 @@ public class TaskService : ITaskService
     {
         string folderPath;
         bool includeSubfolders;
+        bool ignoreSeasonEpisode;
         try
         {
             var body = System.Text.Json.JsonDocument.Parse(task.Body ?? "{}").RootElement;
             folderPath = body.GetProperty("folderPath").GetString() ?? "";
             includeSubfolders = !body.TryGetProperty("includeSubfolders", out var inc) || inc.GetBoolean();
+            ignoreSeasonEpisode = body.TryGetProperty("ignoreSeasonEpisode", out var ise) &&
+                ise.ValueKind == System.Text.Json.JsonValueKind.True;
         }
         catch (Exception ex)
         {
@@ -1233,9 +1236,20 @@ public class TaskService : ITaskService
         }
 
         // Short-lived scope per progress write, same rationale as the
-        // library import task above.
+        // library import task above. Writes are throttled: the scan reports
+        // after every file, and a database write per file (each in its own
+        // scope) was a measurable share of a scan of thousands of files that
+        // are already in the library. The UI polls about once a second.
+        var progressClock = System.Diagnostics.Stopwatch.StartNew();
+        var lastProgressWrite = TimeSpan.MinValue;
         Func<int, int, Task> onProgress = async (done, total) =>
         {
+            if (done > 0 && done < total &&
+                progressClock.Elapsed - lastProgressWrite < TimeSpan.FromMilliseconds(750))
+            {
+                return;
+            }
+            lastProgressWrite = progressClock.Elapsed;
             try
             {
                 using var s = _scopeFactory.CreateScope();
@@ -1260,7 +1274,8 @@ public class TaskService : ITaskService
         var importService = scope.ServiceProvider.GetRequiredService<LibraryImportService>();
 
         var result = await importService.ScanFolderAsync(
-            folderPath, includeSubfolders, onProgress, includeIgnoredFiles: true);
+            folderPath, includeSubfolders, onProgress, includeIgnoredFiles: true,
+            ignoreSeasonEpisode: ignoreSeasonEpisode);
 
         // Same rationale as LibraryImportAsync above: the result column
         // carries the same LibraryScanResult shape the old inline response

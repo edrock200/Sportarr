@@ -161,6 +161,11 @@ const LibraryImportPage: React.FC = () => {
   })();
   const [folderPath, setFolderPath] = useState(initialPath);
   const [includeSubfolders, setIncludeSubfolders] = useState(true);
+  // Media named against TheTVDB (or another provider) carries that
+  // provider's episode numbers, which the matcher would otherwise treat as
+  // authoritative and reject the right event on. When set, the scan strips
+  // S#E# markers from file names before matching.
+  const [ignoreSeasonEpisode, setIgnoreSeasonEpisode] = useState(false);
   const [showFileBrowser, setShowFileBrowser] = useState(false);
 
   // Recently scanned folders, persisted locally so batch importers can hop
@@ -306,7 +311,7 @@ const LibraryImportPage: React.FC = () => {
       // while the scan kept running invisibly. Queue it, then poll the
       // task until it finishes (same pattern as the import step below).
       const response = await apiPost(
-        `/api/library/scan?folderPath=${encodeURIComponent(folderPath)}&includeSubfolders=${includeSubfolders}`,
+        `/api/library/scan?folderPath=${encodeURIComponent(folderPath)}&includeSubfolders=${includeSubfolders}&ignoreSeasonEpisode=${ignoreSeasonEpisode}`,
         {}
       );
 
@@ -792,6 +797,21 @@ const LibraryImportPage: React.FC = () => {
                 className="w-5 h-5 rounded border-gray-600 bg-gray-700 text-red-600 focus:ring-red-500"
               />
               <span className="text-gray-300">Include subfolders (recursive scan)</span>
+            </label>
+
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={ignoreSeasonEpisode}
+                onChange={(e) => setIgnoreSeasonEpisode(e.target.checked)}
+                className="w-5 h-5 mt-0.5 rounded border-gray-600 bg-gray-700 text-red-600 focus:ring-red-500"
+              />
+              <span>
+                <span className="text-gray-300">Ignore S#E# (e.g. Importing from TVDB named media)</span>
+                <span className="block text-xs text-gray-500 mt-0.5">
+                  Matches on the rest of the file name instead of its season/episode numbers. A year-style season (S2024) is still used as the year.
+                </span>
+              </span>
             </label>
           </div>
 
